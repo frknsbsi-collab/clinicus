@@ -1,6 +1,6 @@
 // Uygulama dosyalarını önbelleğe alır; Clinicus internet olmadan da çalışır.
 // Dosyalarda değişiklik yaptığınızda CACHE sürümünü artırın.
-const CACHE = 'clinicus-v1';
+const CACHE = 'clinicus-v2';
 const ASSETS = [
   './',
   './index.html',

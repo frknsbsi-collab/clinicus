@@ -12,10 +12,11 @@ const Store = (() => {
 
   const empty = () => ({
     version: 1,
-    settings: { currency: 'TRY', clinicName: '', lastBackup: null },
-    procedures: [], // { id, name, price }
+    settings: { currency: 'TRY', clinicName: '', lastBackup: null, updatedAt: 0 },
+    procedures: [], // { id, name, price, createdAt, updatedAt }
     patients: [],   // { id, name, personalityNotes, createdAt, updatedAt }
     visits: [],     // { id, patientId, date, time, items:[{procedureId,name,price}], treatmentNotes, createdAt, updatedAt }
+    deleted: {},    // { [id]: silinme zamanı } — silmelerin diğer cihazlara yansıması için
   });
 
   const normalize = (d) => {
@@ -27,8 +28,32 @@ const Store = (() => {
       procedures: Array.isArray(d.procedures) ? d.procedures : [],
       patients: Array.isArray(d.patients) ? d.patients : [],
       visits: Array.isArray(d.visits) ? d.visits : [],
+      deleted: d.deleted && typeof d.deleted === 'object' ? d.deleted : {},
     };
   };
+
+  // İki veri kopyasını birleştirir: kayıt bazında en son güncellenen kazanır,
+  // silinen kayıtlar silinme zamanından sonra güncellenmediyse düşer.
+  // Eşitlikte `a` (yerel) nesnesi korunur ki açık formlar bozulmasın.
+  function merge(a, b) {
+    const ts = (x) => x.updatedAt || x.createdAt || 0;
+    const out = empty();
+    out.deleted = { ...a.deleted };
+    for (const [id, t] of Object.entries(b.deleted)) out.deleted[id] = Math.max(out.deleted[id] || 0, t);
+    for (const k of ['procedures', 'patients', 'visits']) {
+      const m = new Map();
+      for (const x of [...a[k], ...b[k]]) {
+        const cur = m.get(x.id);
+        if (!cur || ts(x) > ts(cur)) m.set(x.id, x);
+      }
+      out[k] = [...m.values()]
+        .filter((x) => !(out.deleted[x.id] >= ts(x)))
+        .sort((x, y) => (x.id < y.id ? -1 : x.id > y.id ? 1 : 0));
+    }
+    out.settings = { ...((b.settings.updatedAt || 0) > (a.settings.updatedAt || 0) ? b.settings : a.settings) };
+    out.settings.lastBackup = Math.max(a.settings.lastBackup || 0, b.settings.lastBackup || 0) || null;
+    return out;
+  }
 
   function load() {
     const raw = localStorage.getItem(KEY);
@@ -55,11 +80,16 @@ const Store = (() => {
   // Tarayıcıdan verilerin otomatik silinmemesi için kalıcı depolama iste
   if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
 
-  return { load, save, empty, normalize };
+  return { load, save, empty, normalize, merge };
 })();
 
 let db = Store.load();
-const save = () => Store.save(db);
+const save = () => {
+  const ok = Store.save(db);
+  if (ok) Sync.schedule();
+  return ok;
+};
+const markDeleted = (ids) => { const t = Date.now(); for (const id of ids) db.deleted[id] = t; };
 
 /* ---------------- Yardımcılar ---------------- */
 const $ = (s, r = document) => r.querySelector(s);
@@ -129,6 +159,7 @@ const I = {
   edit: svg('<path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/>'),
   download: svg('<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>'),
   upload: svg('<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/>'),
+  cloud: svg('<path d="M18 10h-1.26A8 8 0 1 0 9 20h9a5 5 0 0 0 0-10z"/>'),
   file: svg('<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="8" y1="13" x2="16" y2="13"/><line x1="8" y1="17" x2="16" y2="17"/>'),
 };
 document.querySelectorAll('[data-icon]').forEach((el) => { el.outerHTML = I[el.dataset.icon]; });
@@ -186,7 +217,7 @@ function renderHome() {
   const isToday = state.day === today();
 
   const lb = db.settings.lastBackup;
-  const needsBackup = db.visits.length > 0 && (!lb || Date.now() - lb > 14 * 864e5);
+  const needsBackup = !Sync.configured() && db.visits.length > 0 && (!lb || Date.now() - lb > 14 * 864e5);
 
   main.innerHTML = `
     <section class="daybar">
@@ -420,6 +451,8 @@ function renderSettings() {
         <select id="currency">${currencies.map(([k, l]) => `<option value="${k}" ${db.settings.currency === k ? 'selected' : ''}>${l}</option>`).join('')}</select></label>
     </section>
 
+    ${syncPanel()}
+
     <section class="panel">
       <h2>Veriler ve yedekleme</h2>
       <p class="muted">Tüm veriler yalnızca bu cihazda saklanır, hiçbir sunucuya gönderilmez. Tarayıcı verileri silinirse veya cihaz değişirse kayıtlar kaybolabilir; düzenli yedek alın.</p>
@@ -549,6 +582,7 @@ function openVisit(id, preset = {}) {
     'delete-visit': async () => {
       if (!(await confirmBox({ title: 'Kayıt silinsin mi?', message: 'Bu işlem kaydı kalıcı olarak silinecek.', ok: 'Sil', danger: true }))) return;
       db.visits = db.visits.filter((x) => x.id !== v.id);
+      markDeleted([v.id]);
       save();
       closeSheet();
       toast('Kayıt silindi');
@@ -617,12 +651,14 @@ function openVisit(id, preset = {}) {
       .filter((i) => i.name);
     if (!clean.length) { toast('En az bir işlem seçin'); return; }
 
+    // Form açıkken senkron veriyi yenilemiş olabilir; nesneleri id ile güncel veriden al
+    const curOrig = origPatient && getPatient(origPatient.id);
     let patient = findPatientByName(name);
     if (!patient) {
-      const origOnlyThisVisit = v && origPatient && db.visits.every((x) => x.patientId !== origPatient.id || x.id === v.id);
+      const origOnlyThisVisit = v && curOrig && db.visits.every((x) => x.patientId !== curOrig.id || x.id === v.id);
       if (origOnlyThisVisit) {
-        origPatient.name = name; // yazım düzeltmesi
-        patient = origPatient;
+        curOrig.name = name; // yazım düzeltmesi
+        patient = curOrig;
       } else {
         patient = { id: uid(), name, personalityNotes: '', createdAt: Date.now() };
         db.patients.push(patient);
@@ -639,7 +675,9 @@ function openVisit(id, preset = {}) {
       treatmentNotes: form.elements.treatmentNotes.value.trim(),
       updatedAt: Date.now(),
     };
-    if (v) Object.assign(v, data);
+    const curVisit = v && db.visits.find((x) => x.id === v.id);
+    if (curVisit) Object.assign(curVisit, data);
+    else if (v) db.visits.push({ ...v, ...data });
     else db.visits.push({ id: uid(), createdAt: Date.now(), ...data });
 
     if (!save()) return;
@@ -689,6 +727,7 @@ function openPatient(id) {
         ok: 'Sil', danger: true,
       });
       if (!ok) return;
+      markDeleted([p.id, ...db.visits.filter((x) => x.patientId === p.id).map((x) => x.id)]);
       db.patients = db.patients.filter((x) => x.id !== p.id);
       db.visits = db.visits.filter((x) => x.patientId !== p.id);
       save();
@@ -704,9 +743,11 @@ function openPatient(id) {
     const name = cleanName(form.elements.name.value);
     if (!name) { toast('Hasta adını girin'); return; }
     const other = findPatientByName(name);
-    if (other && other !== p) { toast('Bu isimde kayıtlı bir hasta zaten var'); return; }
+    if (other && (!p || other.id !== p.id)) { toast('Bu isimde kayıtlı bir hasta zaten var'); return; }
     const notes = form.elements.personalityNotes.value.trim();
-    if (p) Object.assign(p, { name, personalityNotes: notes, updatedAt: Date.now() });
+    const cur = p && getPatient(p.id);
+    if (cur) Object.assign(cur, { name, personalityNotes: notes, updatedAt: Date.now() });
+    else if (p) db.patients.push({ ...p, name, personalityNotes: notes, updatedAt: Date.now() });
     else db.patients.push({ id: uid(), name, personalityNotes: notes, createdAt: Date.now(), updatedAt: Date.now() });
     save();
     closeSheet();
@@ -734,9 +775,9 @@ function openProcedure(id) {
     e.preventDefault();
     const name = cleanName(form.elements.name.value);
     if (!name) { toast('İşlem adını girin'); return; }
-    if (db.procedures.some((x) => x !== p && norm(x.name) === norm(name))) { toast('Bu isimde bir işlem zaten var'); return; }
-    p.name = name;
-    p.price = num(form.elements.price.value);
+    if (db.procedures.some((x) => x.id !== p.id && norm(x.name) === norm(name))) { toast('Bu isimde bir işlem zaten var'); return; }
+    const cur = db.procedures.find((x) => x.id === p.id) || (db.procedures.push(p), p);
+    Object.assign(cur, { name, price: num(form.elements.price.value), updatedAt: Date.now() });
     save();
     closeSheet();
     toast('İşlem güncellendi');
@@ -811,10 +852,277 @@ async function importJson(file) {
   });
   if (!ok) return;
   const { app, exportedAt, ...rest } = data;
-  db = Store.normalize(rest);
+  const incoming = Store.normalize(rest);
+  // "Değiştir" anlamı senkronda da geçerli olsun: yedekte olmayanlar silinir,
+  // yedektekiler en güncel sayılır (buluttaki eski kopyalar üzerine yazılır).
+  const now = Date.now();
+  const keep = new Set();
+  for (const k of ['procedures', 'patients', 'visits']) for (const x of incoming[k]) { keep.add(x.id); x.updatedAt = now; }
+  const deleted = { ...db.deleted };
+  for (const id of keep) delete deleted[id];
+  for (const k of ['procedures', 'patients', 'visits']) for (const x of db[k]) if (!keep.has(x.id)) deleted[x.id] = now;
+  incoming.deleted = deleted;
+  incoming.settings.updatedAt = now;
+  db = incoming;
   save();
   toast('Yedek geri yüklendi');
   render();
+}
+
+/* ---------------- Bulut senkronu (şifreli, private GitHub deposu) ----------------
+   Veriler cihazda parola ile AES-256-GCM şifrelenir (anahtar PBKDF2-SHA256 ile
+   türetilir), depoya yalnızca şifreli dosya yazılır. Token, türetilmiş anahtar ve
+   ayarlar bu cihazda ayrı bir anahtarda tutulur; yedek dosyalarına girmez.
+   ------------------------------------------------------------------------------- */
+const Sync = (() => {
+  const KEY = 'clinicus.sync.v1';
+  const FILE = 'clinicus-data.enc.json';
+  const ITERATIONS = 600000;
+  const API = 'https://api.github.com';
+
+  let cfg = null;
+  try { cfg = JSON.parse(localStorage.getItem(KEY) || 'null'); } catch {}
+  let key = null;
+  let timer = null;
+  let running = null;
+  let dirty = false;
+  let lastPull = 0;
+  const status = { state: cfg ? 'idle' : 'off', message: '' };
+
+  const te = new TextEncoder();
+  const td = new TextDecoder();
+  const b64enc = (buf) => {
+    const b = new Uint8Array(buf);
+    let s = '';
+    for (let i = 0; i < b.length; i += 0x8000) s += String.fromCharCode.apply(null, b.subarray(i, i + 0x8000));
+    return btoa(s);
+  };
+  const b64dec = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
+
+  async function deriveKey(pass, saltB64, iterations) {
+    const base = await crypto.subtle.importKey('raw', te.encode(pass), 'PBKDF2', false, ['deriveKey']);
+    return crypto.subtle.deriveKey(
+      { name: 'PBKDF2', salt: b64dec(saltB64), iterations, hash: 'SHA-256' },
+      base, { name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt']);
+  }
+  async function getKey() {
+    if (!key) key = await crypto.subtle.importKey('raw', b64dec(cfg.key), 'AES-GCM', false, ['encrypt', 'decrypt']);
+    return key;
+  }
+  async function encrypt(k, obj) {
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, k, te.encode(JSON.stringify(obj)));
+    return { app: 'clinicus', format: 1, kdf: { name: 'PBKDF2-SHA256', iterations: cfg.iterations, salt: cfg.salt }, iv: b64enc(iv), data: b64enc(ct) };
+  }
+  async function decrypt(k, file) {
+    const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: b64dec(file.iv) }, k, b64dec(file.data));
+    return JSON.parse(td.decode(pt));
+  }
+
+  class SyncError extends Error {}
+  async function gh(c, path, opts = {}) {
+    let res;
+    try {
+      res = await fetch(API + path, {
+        ...opts,
+        cache: 'no-store',
+        headers: { Authorization: `Bearer ${c.token}`, Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28', ...(opts.headers || {}) },
+      });
+    } catch {
+      throw Object.assign(new SyncError('İnternet bağlantısı yok'), { offline: true });
+    }
+    if (res.status === 401) throw new SyncError('Token geçersiz veya süresi dolmuş. Yeni token girin.');
+    if (res.status === 403 && res.headers.get('x-ratelimit-remaining') === '0') throw new SyncError('GitHub istek sınırı doldu, biraz sonra tekrar denenecek.');
+    if (res.status === 403) throw new SyncError("Token'ın bu depoya yazma izni yok (Contents: Read and write gerekli).");
+    return res;
+  }
+
+  async function fetchRemote(c) {
+    const res = await gh(c, `/repos/${c.owner}/${c.repo}/contents/${FILE}`);
+    if (res.status === 404) return null;
+    if (!res.ok) throw new SyncError(`GitHub hatası (${res.status})`);
+    const j = await res.json();
+    let content = j.content;
+    if (!content) { // 1 MB üstü dosyalar blob API'den gelir
+      const b = await gh(c, `/repos/${c.owner}/${c.repo}/git/blobs/${j.sha}`);
+      content = (await b.json()).content;
+    }
+    return { sha: j.sha, file: JSON.parse(atob(content.replace(/\n/g, ''))) };
+  }
+
+  async function pushRemote(c, file, sha) {
+    const res = await gh(c, `/repos/${c.owner}/${c.repo}/contents/${FILE}`, {
+      method: 'PUT',
+      body: JSON.stringify({ message: `Clinicus senkron ${new Date().toISOString()}`, content: btoa(JSON.stringify(file)), ...(sha ? { sha } : {}) }),
+    });
+    if (res.status === 409 || res.status === 422) return null; // başka cihaz araya girdi
+    if (!res.ok) throw new SyncError(`GitHub'a yazılamadı (${res.status})`);
+    return (await res.json()).content.sha;
+  }
+
+  function setStatus(state, message = '') {
+    status.state = state;
+    status.message = message;
+    updateBadge();
+    const el = $('#syncStatus');
+    if (el) el.innerHTML = statusHtml();
+  }
+
+  async function runSync() {
+    if (!cfg) return;
+    if (!navigator.onLine) { setStatus('offline', 'Çevrimdışı — bağlantı gelince senkronlanacak'); return; }
+    setStatus('syncing');
+    try {
+      const k = await getKey();
+      for (let attempt = 0; attempt < 3; attempt++) {
+        dirty = false;
+        const remote = await fetchRemote(cfg);
+        let remoteData = Store.empty();
+        if (remote) {
+          try { remoteData = Store.normalize(await decrypt(k, remote.file)); }
+          catch { throw new SyncError('Buluttaki veri bu parolayla çözülemedi. Bağlantıyı kaldırıp doğru parolayla yeniden bağlanın.'); }
+        }
+        const merged = Store.merge(db, remoteData);
+        const before = JSON.stringify(db);
+        const needPush = !remote || JSON.stringify(Store.merge(remoteData, remoteData)) !== JSON.stringify(merged);
+        // Ağ beklenirken yapılan yerel değişiklikler de korunur
+        db = Store.merge(db, merged);
+        Store.save(db);
+        if (JSON.stringify(db) !== before) render();
+        if (needPush) {
+          const sha = await pushRemote(cfg, await encrypt(k, db), remote?.sha);
+          if (!sha) continue; // çakışma: yeniden çek ve birleştir
+        }
+        cfg.lastSync = Date.now();
+        localStorage.setItem(KEY, JSON.stringify(cfg));
+        lastPull = Date.now();
+        setStatus('idle');
+        return;
+      }
+      throw new SyncError('Başka bir cihazla çakışma çözülemedi, tekrar denenecek.');
+    } catch (e) {
+      if (e.offline) setStatus('offline', 'Çevrimdışı — bağlantı gelince senkronlanacak');
+      else setStatus('error', e instanceof SyncError ? e.message : `Beklenmeyen hata: ${e.message}`);
+    }
+  }
+
+  function syncNow() {
+    if (!cfg) return Promise.resolve();
+    clearTimeout(timer);
+    if (running) { dirty = true; return running; }
+    running = runSync().finally(() => {
+      running = null;
+      if (dirty) schedule();
+    });
+    return running;
+  }
+
+  function schedule(delay = 4000) {
+    if (!cfg) return;
+    dirty = true;
+    if (status.state !== 'syncing') setStatus('pending');
+    clearTimeout(timer);
+    timer = setTimeout(syncNow, delay);
+  }
+
+  async function connect({ repo, token, pass }) {
+    const m = String(repo).trim().replace(/^https?:\/\/github\.com\//, '').replace(/\.git$/, '').replace(/\/$/, '').match(/^([\w.-]+)\/([\w.-]+)$/);
+    if (!m) throw new SyncError('Depoyu "kullanıcıadı/depo" biçiminde girin.');
+    const c = { owner: m[1], repo: m[2], token: token.trim() };
+    const info = await gh(c, `/repos/${c.owner}/${c.repo}`);
+    if (info.status === 404) throw new SyncError('Depo bulunamadı. Adı doğru mu ve token bu depoya erişebiliyor mu?');
+    if (!info.ok) throw new SyncError(`GitHub hatası (${info.status})`);
+    const repoInfo = await info.json();
+    if (!repoInfo.private) throw new SyncError('Bu depo herkese açık (public). Hasta verisi için yalnızca private depo kullanılabilir.');
+    if (repoInfo.permissions && !repoInfo.permissions.push) throw new SyncError("Token'ın bu depoya yazma izni yok (Contents: Read and write gerekli).");
+
+    const remote = await fetchRemote(c);
+    const salt = remote ? remote.file.kdf.salt : b64enc(crypto.getRandomValues(new Uint8Array(16)));
+    const iterations = remote ? remote.file.kdf.iterations : ITERATIONS;
+    const k = await deriveKey(pass, salt, iterations);
+    if (remote) {
+      try { await decrypt(k, remote.file); }
+      catch { throw new SyncError('Parola yanlış: buluttaki veri bu parolayla açılamadı.'); }
+    }
+    cfg = { ...c, salt, iterations, key: b64enc(await crypto.subtle.exportKey('raw', k)), lastSync: null, connectedAt: Date.now() };
+    key = null;
+    localStorage.setItem(KEY, JSON.stringify(cfg));
+    setStatus('idle');
+    await syncNow();
+    return !!remote;
+  }
+
+  function disconnect() {
+    clearTimeout(timer);
+    cfg = null;
+    key = null;
+    localStorage.removeItem(KEY);
+    setStatus('off');
+  }
+
+  function statusHtml() {
+    const map = {
+      idle: ['ok', 'Senkronize'],
+      pending: ['wait', 'Değişiklikler gönderilecek…'],
+      syncing: ['wait', 'Senkronize ediliyor…'],
+      offline: ['warn', 'Çevrimdışı'],
+      error: ['err', 'Senkron hatası'],
+      off: ['', 'Kapalı'],
+    };
+    const [cls, label] = map[status.state] || map.off;
+    return `<span class="sync-dot ${cls}"></span><b>${label}</b>${status.message ? `<br><small>${esc(status.message)}</small>` : ''}`;
+  }
+
+  function updateBadge() {
+    const b = $('#syncBadge');
+    if (!b) return;
+    b.hidden = !cfg;
+    const cls = { idle: 'ok', pending: 'wait', syncing: 'wait', offline: 'warn', error: 'err' }[status.state] || '';
+    b.className = `sync-badge ${cls}`;
+    b.title = { idle: 'Senkronize', pending: 'Gönderilecek', syncing: 'Senkronize ediliyor', offline: 'Çevrimdışı', error: 'Senkron hatası' }[status.state] || '';
+  }
+
+  // Uygulamaya geri dönünce / bağlantı gelince buluttan çek
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && cfg && Date.now() - lastPull > 30000) syncNow();
+    if (document.visibilityState === 'hidden' && cfg && dirty) syncNow();
+  });
+  window.addEventListener('online', () => { if (cfg) syncNow(); });
+  window.addEventListener('offline', () => { if (cfg) setStatus('offline', 'Çevrimdışı — bağlantı gelince senkronlanacak'); });
+
+  return {
+    configured: () => !!cfg,
+    info: () => cfg && { owner: cfg.owner, repo: cfg.repo, lastSync: cfg.lastSync },
+    connect, disconnect, syncNow, schedule, statusHtml, updateBadge, SyncError,
+  };
+})();
+
+function syncPanel() {
+  if (Sync.configured()) {
+    const i = Sync.info();
+    return `
+      <section class="panel">
+        <h2>Bulut senkronu</h2>
+        <p class="muted">Veriler şifrelenerek <b>${esc(i.owner)}/${esc(i.repo)}</b> deposuna otomatik yedekleniyor. Diğer cihazlarınızda aynı depo ve parola ile bağlanırsanız kayıtlar birleşir.</p>
+        <div class="sync-status" id="syncStatus">${Sync.statusHtml()}</div>
+        <div class="kv"><span>Son senkron</span><b>${i.lastSync ? esc(new Date(i.lastSync).toLocaleString('tr-TR', { dateStyle: 'medium', timeStyle: 'short' })) : '—'}</b></div>
+        <button class="secondary block" data-act="sync-now">${I.cloud} Şimdi senkronla</button>
+        <button class="danger ghost block" data-act="sync-disconnect">Bu cihazın bağlantısını kaldır</button>
+      </section>`;
+  }
+  return `
+    <section class="panel">
+      <h2>Bulut senkronu</h2>
+      <p class="muted">Verilerinizi kendi <b>private</b> GitHub deponuza <b>şifreli</b> olarak otomatik yedekleyin. GitHub dahil kimse içeriği okuyamaz. Telefon değiştirdiğinizde veya ikinci cihazda aynı bilgilerle bağlanın.</p>
+      <form id="syncForm" autocomplete="off">
+        <label class="field"><span>Depo</span><input name="repo" placeholder="kullaniciadi/clinicus-data" autocapitalize="off" spellcheck="false"></label>
+        <label class="field"><span>GitHub token</span><input name="token" type="password" placeholder="github_pat_…" autocapitalize="off" spellcheck="false"></label>
+        <label class="field"><span>Şifreleme parolası</span><input name="pass" type="password" autocomplete="new-password" placeholder="En az 10 karakter"></label>
+        <label class="field"><span>Parola (tekrar)</span><input name="pass2" type="password" autocomplete="new-password"></label>
+        <small class="hint">Parolayı unutursanız buluttaki veriler <b>kurtarılamaz</b>. Güvenli bir yere not edin. İkinci cihazda aynı parolayı girin.</small>
+        <div class="actions"><button type="submit" class="primary" id="syncConnectBtn">${I.cloud} Bağlan ve senkronla</button></div>
+      </form>
+    </section>`;
 }
 
 /* ---------------- Olaylar ---------------- */
@@ -844,9 +1152,22 @@ main.addEventListener('click', async (e) => {
       const p = db.procedures.find((x) => x.id === id);
       if (p && await confirmBox({ title: 'İşlem türü silinsin mi?', message: `<b>${esc(p.name)}</b> listeden kaldırılacak. Geçmiş kayıtlar etkilenmez.`, ok: 'Sil', danger: true })) {
         db.procedures = db.procedures.filter((x) => x.id !== id);
+        markDeleted([id]);
         save();
         render();
       }
+      break;
+    }
+    case 'sync-now': Sync.syncNow().then(() => { if (state.tab === 'settings') render(); }); break;
+    case 'sync-disconnect': {
+      const ok = await confirmBox({
+        title: 'Bulut bağlantısı kaldırılsın mı?',
+        message: 'Bu cihaz artık senkronlanmaz. Telefondaki ve buluttaki veriler <b>silinmez</b>. Daha sonra aynı depo, token ve parolayla yeniden bağlanabilirsiniz.',
+        ok: 'Bağlantıyı kaldır',
+      });
+      if (!ok) return;
+      Sync.disconnect();
+      render();
       break;
     }
     case 'export-json': exportJson(); break;
@@ -855,10 +1176,11 @@ main.addEventListener('click', async (e) => {
     case 'wipe-records': {
       const ok = await confirmBox({
         title: 'Kayıtlar silinsin mi?',
-        message: `Tüm hastalar ve işlem kayıtları <b>kalıcı olarak</b> silinecek. İşlem türleri ve ayarlar korunur. Önce yedek almanız önerilir.<br><br>Onaylamak için <b>SİL</b> yazın.`,
+        message: `Tüm hastalar ve işlem kayıtları <b>kalıcı olarak</b> silinecek${Sync.configured() ? ' (<b>buluttaki kopya dahil</b>)' : ''}. İşlem türleri ve ayarlar korunur. Önce yedek almanız önerilir.<br><br>Onaylamak için <b>SİL</b> yazın.`,
         ok: 'Kalıcı olarak sil', danger: true, requireText: 'SİL',
       });
       if (!ok) return;
+      markDeleted([...db.patients, ...db.visits].map((x) => x.id));
       db.patients = [];
       db.visits = [];
       save();
@@ -869,12 +1191,22 @@ main.addEventListener('click', async (e) => {
     case 'wipe-all': {
       const ok = await confirmBox({
         title: 'Tüm veriler silinsin mi?',
-        message: `Hastalar, işlem kayıtları, işlem türleri ve ayarlar dahil <b>her şey kalıcı olarak</b> silinecek. Önce yedek almanız önerilir.<br><br>Onaylamak için <b>SİL</b> yazın.`,
+        message: `Hastalar, işlem kayıtları, işlem türleri ve ayarlar dahil <b>her şey kalıcı olarak</b> silinecek${Sync.configured() ? '. <b>Buluttaki kopya da silinir</b> ve bu cihazın bulut bağlantısı kaldırılır' : ''}. Önce yedek almanız önerilir.<br><br>Onaylamak için <b>SİL</b> yazın.`,
         ok: 'Her şeyi sil', danger: true, requireText: 'SİL',
       });
       if (!ok) return;
+      const ids = [...db.procedures, ...db.patients, ...db.visits].map((x) => x.id);
+      const prevDeleted = db.deleted;
       db = Store.empty();
-      save();
+      db.deleted = prevDeleted;
+      markDeleted(ids);
+      db.settings.updatedAt = Date.now();
+      Store.save(db);
+      if (Sync.configured()) {
+        toast('Buluttaki kopya siliniyor…');
+        await Sync.syncNow();
+        Sync.disconnect();
+      }
       toast('Tüm veriler silindi');
       render();
       break;
@@ -891,19 +1223,42 @@ main.addEventListener('change', (e) => {
   if (t.id === 'dayPicker' && t.value) { state.day = t.value; render(); }
   else if (t.id === 'fromDate' && t.value) { state.from = t.value; render(); }
   else if (t.id === 'toDate' && t.value) { state.to = t.value; render(); }
-  else if (t.id === 'currency') { db.settings.currency = t.value; save(); toast('Para birimi güncellendi'); }
-  else if (t.id === 'clinicName') { db.settings.clinicName = t.value.trim(); save(); $('#clinicLabel').textContent = db.settings.clinicName; toast('Kaydedildi'); }
+  else if (t.id === 'currency') { db.settings.currency = t.value; db.settings.updatedAt = Date.now(); save(); toast('Para birimi güncellendi'); }
+  else if (t.id === 'clinicName') { db.settings.clinicName = t.value.trim(); db.settings.updatedAt = Date.now(); save(); $('#clinicLabel').textContent = db.settings.clinicName; toast('Kaydedildi'); }
   else if (t.id === 'importFile' && t.files[0]) { importJson(t.files[0]); t.value = ''; }
 });
 
-main.addEventListener('submit', (e) => {
+main.addEventListener('submit', async (e) => {
+  if (e.target.id === 'syncForm') {
+    e.preventDefault();
+    const f = e.target.elements;
+    const repo = f.repo.value.trim();
+    const token = f.token.value.trim();
+    const pass = f.pass.value;
+    if (!repo || !token) { toast('Depo ve token gerekli'); return; }
+    if (pass.length < 10) { toast('Parola en az 10 karakter olmalı'); f.pass.focus(); return; }
+    if (pass !== f.pass2.value) { toast('Parolalar eşleşmiyor'); f.pass2.focus(); return; }
+    const btn = $('#syncConnectBtn');
+    btn.disabled = true;
+    btn.textContent = 'Bağlanıyor…';
+    try {
+      const existed = await Sync.connect({ repo, token, pass });
+      toast(existed ? 'Bağlandı, buluttaki verilerle birleştirildi' : 'Bağlandı, ilk yedek buluta gönderildi');
+      render();
+    } catch (err) {
+      toast(err instanceof Sync.SyncError ? err.message : `Bağlanılamadı: ${err.message}`);
+      btn.disabled = false;
+      btn.innerHTML = `${I.cloud} Bağlan ve senkronla`;
+    }
+    return;
+  }
   if (e.target.id !== 'procForm') return;
   e.preventDefault();
   const f = e.target.elements;
   const name = cleanName(f.name.value);
   if (!name) { toast('İşlem adını girin'); f.name.focus(); return; }
   if (db.procedures.some((x) => norm(x.name) === norm(name))) { toast('Bu isimde bir işlem zaten var'); return; }
-  db.procedures.push({ id: uid(), name, price: num(f.price.value) });
+  db.procedures.push({ id: uid(), name, price: num(f.price.value), createdAt: Date.now(), updatedAt: Date.now() });
   save();
   render();
   toast('İşlem türü eklendi');
@@ -916,6 +1271,9 @@ window.addEventListener('storage', () => { db = Store.load(); render(); });
 /* ---------------- Başlat ---------------- */
 if (!db.procedures.length && !db.visits.length) state.tab = 'settings';
 render();
+Sync.updateBadge();
+Sync.syncNow();
+$('#syncBadge').addEventListener('click', () => setTab('settings'));
 
 if ('serviceWorker' in navigator && location.protocol.startsWith('http')) {
   navigator.serviceWorker.register('sw.js').catch(() => {});

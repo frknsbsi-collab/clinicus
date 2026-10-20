@@ -271,6 +271,25 @@ dialog::backdrop { background: rgba(5, 15, 20, .5); }
 .confirm .actions { margin-top: 14px; }
 .confirm .actions button { flex: 1; }
 
+/* ---------- sync ---------- */
+.sync-badge {
+  margin-left: auto; position: relative; display: grid; place-items: center;
+  width: 40px; height: 40px; border: 0; border-radius: 10px; background: transparent; color: var(--muted);
+}
+.sync-badge[hidden] { display: none; }
+.sync-badge::after {
+  content: ""; position: absolute; right: 7px; bottom: 9px;
+  width: 9px; height: 9px; border-radius: 50%; border: 2px solid var(--bg); background: var(--muted);
+}
+.sync-badge.ok::after, .sync-dot.ok { background: #2e9e5b; }
+.sync-badge.wait::after, .sync-dot.wait { background: #d9a400; }
+.sync-badge.warn::after, .sync-dot.warn { background: #8a99a3; }
+.sync-badge.err::after, .sync-dot.err { background: var(--danger); }
+.sync-badge.err { color: var(--danger); }
+.sync-status { background: var(--surface-2); border-radius: 12px; padding: 10px 12px; font-size: 14px; }
+.sync-status small { color: var(--muted); }
+.sync-dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 8px; background: var(--muted); }
+
 /* ---------- toast ---------- */
 #toast {
   position: fixed; left: 50%; bottom: calc(86px + env(safe-area-inset-bottom)); z-index: 100;
